@@ -1,0 +1,1365 @@
+---
+title: nlmixr2建模示例1
+author: zdd
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+  word_document:
+    toc: true
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE,
+  warning = FALSE,
+  out.width = "100%",
+  cache = TRUE
+)
+```
+
+载入需要的R包
+
+```{r setup}
+library(xgxr)
+library(nlmixr2)
+library(ggPMX)
+library(patchwork)
+library(tidyverse)
+library(skimr)
+library(GGally)
+```
+
+# step 1:读取和处理数据
+
+先设置R工作路径 使用read_csv()读入以,为分隔符的文件，使用read_table()读入以空格为分隔符的文件
+
+```{r read}
+#setwd("C:/Users/zhang/Desktop/nlmixr2/ex1") #设置数据所在文件夹为R工作路径
+#pkdata <- read_csv("pktab1", skip = 1)
+pkdata <- read_table("pktab1", skip = 1)
+```
+
+查看数据结构，注意行数和列数是否正确
+
+```{r view}
+glimpse(pkdata)
+#str(pkdata)
+#View(pkdata)
+```
+
+用tidyverse处理数据，生成其他数据列，将分类型数据改为因子型，方便后续处理和建模
+
+```{r mutate}
+pkdata <- 
+  pkdata %>% 
+  mutate(days = factor(ifelse(TIME < 24, "Day 1", "After Day 1")),
+         SEX = factor(SEX),
+         CENT = factor(CENT))
+```
+
+# step2: 探索性数据分析（EDA）
+
+提取ID列表和协变量列表
+
+查看数据ID列表和个数，核对是否符合预期
+
+```{r ID_list}
+ID_list <- pkdata %>% distinct(ID)
+ID_list %>% pull()
+ID_list %>% count() %>% knitr::kable()
+```
+
+提取给药行（每个ID的第一行）数据生成协变量列表，方便后续对每个个体的协变量进行描述性统计和作图
+
+```{r cov_data}
+covdata <- pkdata %>% distinct(ID, .keep_all = T) 
+covdata %>% head(10) %>% knitr::kable()
+```
+
+进行协变量描述性统计，协变量可以按照因子（比如SEX）分层后再描述性统计
+
+```{r skim}
+colnames(covdata)#查看列名
+covdata %>%  
+  #filter(SEX == 0) %>%  #取SEX某个水平子集
+  select(c(WT, CRCL, AGE, SEX, CENT)) %>% 
+  skim()
+```
+
+取多个因子生成交叉频数和比例表
+
+```{r n_prop}
+covdata %>% 
+  count(SEX, CENT) %>% 
+  mutate(prop = n/sum(n)*100) %>% 
+  knitr::kable()
+```
+
+使用xgx包核对数据,注意该函数对数据列的要求
+
+```{r xgx_check}
+check <- xgx_check_data(pkdata, c("WT", "CRCL", "AGE", "SEX", "CENT"))
+knitr::kable(check$summary)
+knitr::kable(head(check$data_subset))
+knitr::kable(check$cts_covariates)
+knitr::kable(check$cat_covariates)
+```
+
+## 计算PK参数并作dose_parameter图
+
+```{r pk_params}
+PK_params <- pkdata %>%
+  filter(days == "Day 1") %>%
+  group_by(ID) %>%
+  summarize(
+    Cmax = max(DV, na.rm = TRUE),
+    Tmax = TIME[which.max(DV)],
+    Tlast = TIME[length(TIME)],
+    Ctrough = DV[length(TIME)],
+    AUClast = sum(diff(TIME) * (DV[-1] + DV[-length(DV)]) / 2),
+    DOSE =AMT[1]
+  )
+
+PK_params %>% head(10) %>% knitr::kable()
+```
+
+作AUClast vs Dose图，注意观察dose与AUC线性关系
+
+此处只有一个dose level，观察不出关系
+
+```{r auc_dose}
+AUC_dose <- covdata %>% 
+  select(c(ID, AMT)) %>% 
+  right_join(PK_params, by = "ID")
+
+AUC_dose %>% 
+  ggplot(aes(x = AMT,
+             y = AUClast)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1) +
+  theme_bw2()
+```
+
+## 作矩阵图，观察数据协变量分布情况以及哪些协变量共线性
+
+```{r matrix}
+covdata %>% 
+  ggpairs(columns = c("AGE", "WT", "CRCL"),
+          aes(color = SEX,
+              alpha = 0.5),
+          lower = list(continuous = "smooth"))
+
+# 分类协变量和连续协变量混合
+covdata %>% 
+  ggpairs(columns = c("AGE", "WT", "CRCL", "CENT", "SEX"),
+          aes(#color = SEX,
+              alpha = 0.5),
+          lower = list(combo = "facetdensity"))
+```
+
+## 使用xGx包作药时曲线图
+
+创建所有个体的血浆浓度图
+
+```{r conc_time}
+ggp1<-
+  pkdata %>% 
+  filter(TIME%%24 != 0) %>% 
+  ggplot(aes(x = TIME, y = DV)) +
+  geom_line(aes(group = ID), color = "grey50",
+            linewidth = 1, alpha = 0.3) +
+  labs(y = "Conc. (ng/mL)") +
+  theme(legend.position = "none")
+print(ggp1)
+
+# 将x轴从小时改为天，并添加适当的标签
+ggp2 <- ggp1 + 
+  xgx_scale_x_time_units(units_dataset = "hours", units_plot = "days")
+print(ggp2)
+
+# ggp1改为半对数图
+ggp3 <- ggp1 + xgx_scale_y_log10()
+print(ggp3)
+# 提示使用什么模型?
+
+# 如果数据具有相似的采样时间，XGX可以总结平均值加95% CI 
+ggp4 <- ggp3 + xgx_geom_ci(aes(x = TIME, color = NULL, group = NULL, shape = NULL), conf_level = 0.95)
+print(ggp4)
+
+# 在线性尺度上作图（CI是假设对称的，导致CI跨越零）
+ggp5 <- ggp1 + xgx_geom_ci(aes(x = TIME, color = NULL, group = NULL, shape = NULL), conf_level = 0.95)
+print(ggp5)
+
+# 作中位数和95%的数据区间图
+ggp6 <- ggp1 + xgx_geom_pi(aes(x = TIME, color = NULL, group = NULL, shape = NULL)) 
+print(ggp6)
+ggp7 <- ggp6 + xgx_annotate_status(status = "DRAFT") #添加水印"DRAFT"表示非最终结果
+ggp7
+```
+
+# step 3: 估计模型初始值
+
+使用PKNCA包计算密集采样个点单次给药的PK参数
+
+```{r nca}
+# 载入PKNCA包
+library(PKNCA)
+# 准备数据
+nca_data <- pkdata %>%
+  filter(days == "Day 1")
+# 设置NCA参数
+conc_obj <- PKNCAconc(nca_data, 
+                      DV ~ TIME | ID,
+                      concu = "ng/mL",
+                      timeu = "hr")
+dose_data <- pkdata %>%
+  filter(EVID == 1,
+         days == "Day 1")
+dose_obj <- PKNCAdose(dose_data,
+                      AMT ~ TIME | ID,
+                      doseu = "mg")
+# 执行NCA分析
+PKNCA_manual <- data.frame(start=0,
+                           end=Inf,
+                           cmax=TRUE,
+                           tmax=TRUE,
+                           half.life=TRUE,
+                           aucinf.obs=TRUE,
+                           auclast=TRUE,
+                           vz.obs=TRUE,
+                           vz.pred=FALSE,
+                           cl.obs=TRUE,
+                           cl.pred=FALSE)
+PKNCA_obj <- PKNCAdata(conc_obj, 
+                       dose_obj,
+                       intervals=PKNCA_manual)
+results_obj <- pk.nca(PKNCA_obj)
+# 查看结果
+summary(results_obj) %>% knitr::kable()
+```
+
+粗略的计算模型初始值
+
+NCA得到CL_nca和V_nca，如果建模一房室模型，cl = CL_NCA，vc = V_nca；如果建模二房室模型，cl = Q = CL_nca，vc = vp = V_nca / 2
+
+# step 4_1: 建模一房室比例型残差模型
+
+转化DV的单位从ng/mL到mg/L，与AMT和PK参数单位一致
+
+```{r convert_DV}
+pkdata <- mutate(pkdata,
+                 DV = DV/1000)
+```
+
+```{r run001}
+one.cmt.prop <- \(){
+  ini({
+    # 在ini模块定义初始值，类似NONMEM的$THETA、$OMEGA和$SIGMA
+    # 使用赋值操作符（<-或=）定义theta值和残差，用~定义Etas
+    # theta和残差的标签会在最终输出中以parameter名出现
+    lcl = log(6.65)  #log Cl (L/h)
+    lv  = log(135)      #log v (L)
+    eta.cl ~ 0.1
+    eta.v ~ 0.1
+    prop.err = 0.15   #proportional error (SD/mean)
+  })
+  model({
+    # 定义模型结构
+    cl = exp(lcl + eta.cl)
+    v  = exp(lv  + eta.v )
+    ## 使用linCmt自动定义解析解模型
+    ## 残差为比例误差
+    linCmt() ~ prop(prop.err)
+  })
+}
+# 清理缓存，确保没有剩余的旧模型
+rxClean()
+# 检查模型和nlmixr2所做的一些假设
+nlmixr2(one.cmt.prop())
+# 使用nlmixr2估计参数
+run001 <- 
+  nlmixr2(
+    one.cmt.prop,    #建模初始值和模型结构
+    pkdata,            #建模数据集
+    est = "saem",      #估计算法，常用focei和seam
+    #the SAEM minimisation options:
+    saemControl(nBurn = 200, #200 SAEM burn-in iterations (the default)
+                nEm   = 300, #300 EM iterations (the default)
+                print = 50), #print every 50th iteration
+    #only print every 50th estimation step (default=1 which gives endless output)
+    tableControl(cwres = TRUE, npde = TRUE) #calculates NONMEM-style conditional weighted residuals and npde for diagnostics
+  ) # 可以用addCwres和addNpde后面添加cwres和npde
+
+# 建模结果存储在nlmixr2对象中，查看结果
+run001
+```
+
+保存建模结果以备将来使用
+
+```{r save_model}
+save(run001, file = "run001.Rdata")
+#load(file = "run001.Rdata") #载入保存过的建模结果
+```
+
+对于SAEM算法，可以使用参数跟踪图来检查收敛性
+
+```{r trace}
+traceplot(run001)
+```
+
+# step 5_1: 模型评价_run001
+
+查看目标函数值（OFV）/赤池信息准则（AIC）/条件数/参数值等
+
+```{r}
+run001$objDf
+```
+
+查看参数估算值与相对标准误与个体间变异的收缩(ETA Shrinkage) 
+
+```{r}
+run001$parFixed %>% knitr::kable()
+```
+
+可以从run001直接导出以上汇总信息，此处未展示结果
+
+```{r, echo=TRUE, results='hide'}
+run001
+```
+
+查看个体间变异的收缩(ETA Shrinkage) 和残差变异的收缩(EPS Shrinkage)
+
+```{r}
+run001$shrink %>% knitr::kable()
+```
+
+使用nlmixr2内置的基本拟合图，此处未展示结果
+
+```{r, echo=TRUE, results='hide', fig.show='hide'}
+run001 %>% plot() #生成大量诊断图
+```
+
+## 使用ggPMX进行模型评价
+
+首先构造ggPMX控制器
+
+```{r}
+ctr001 <- pmx_nlmixr(run001,
+                     conts = c("WT", "CRCL", "AGE"), #连续变量名
+                     cats = c("SEX", "CENT"), #分类变量名
+                     vpc = FALSE,
+                     settings = pmx_settings(is.draft = TRUE))
+```
+
+ggPMX控制器可以生成各种诊断图，使用plot_names()查看所有图名，用pmx_plot_前缀加图名生成图
+
+```{r}
+ctr001 %>% plot_names()
+```
+
+生成DV vs PRED plot
+
+```{r}
+ctr001 %>% pmx_plot_dv_pred(scale_x_log10=TRUE, scale_y_log10=TRUE) + labs(title = "观测值 vs 群体预测值")
+```
+
+生成DV vs IPRED plot 
+
+```{r}
+ctr001 %>% pmx_plot_dv_ipred(scale_x_log10=TRUE, scale_y_log10=TRUE)
+```
+
+生成个体预测诊断图
+
+```{r}
+ctr001 %>% pmx_plot_individual(facets = list(nrow = 3, ncol = 3), which_pages = "all")
+```
+
+生成条件加权残差(CWRES)相关的诊断图 CWRES基于FOCE算法计算而来，性能优于加权残差(WRES,目前很少使用) 
+
+CWRES-时间散点图
+
+```{r}
+ctr001 %>% pmx_plot_cwres_time()
+```
+
+CWRES-群体预测值散点图:
+
+```{r}
+ctr001 %>% pmx_plot_cwres_pred()
+ctr001 %>% pmx_plot_cwres_cpred()
+```
+
+观察Cwres是否符合正态分布
+
+```{r}
+ctr001 %>% pmx_plot_cwres_qq()
+```
+
+个体加权残差(IWRES)相关的诊断图 评估模型的系统性偏差;检测残差模型是否合适;识别异常个体或异常数据
+
+```{r}
+ctr001 %>% pmx_plot_iwres_time()
+ctr001 %>% pmx_plot_iwres_ipred()
+```
+
+绝对个体加权残差来研究残差误差模型
+
+```{r}
+ctr001 %>% pmx_plot_abs_iwres_ipred()
+```
+
+绝对个体加权残差与时间的关系，以检测模型差异
+
+```{r}
+ctr001 %>% pmx_plot_abs_iwres_time()
+```
+
+观察iwres是否符合正态分布
+
+```{r}
+ctr001 %>% pmx_plot_iwres_qq()
+ctr001 %>% pmx_plot_iwres_dens()
+```
+
+基于经验贝叶斯估计(EBE)的诊断图
+
+ETA与协变量的散点图/箱线图 基于视觉评估参数与协变量之间的相关性.连续型协变量适宜采用散点图,分级型协变量则适合使用箱型图 ETA高收缩时,ETA与协变量的关系图可能会失真
+
+```{r}
+ctr001 %>% pmx_plot_eta_conts()
+ctr001 %>% pmx_plot_eta_cats()
+```
+
+PK参数之间的ETA散点图 考察参数间的相关性.如存在相关性,可通过协方差纳入 ETA高收缩时,ETA与ETA之间的关系图可能会失真
+
+```{r}
+ctr001 %>% pmx_plot_eta_matrix()
+```
+
+ETA直方分布图与Q-Q图
+
+ETA的直方图和QQ图可检验参数的ETA是否呈正态分布,以及ETA模型是否合理
+
+```{r}
+ctr001 %>% pmx_plot_eta_box() 
+ctr001 %>% pmx_plot_eta_hist() 
+ctr001 %>% pmx_plot_eta_qq()
+```
+
+基于模拟(Simulated-based)的诊断图
+
+npde vs pred plot
+
+```{r}
+ctr001 %>% pmx_plot_npde_qq()
+ctr001 %>% pmx_plot_npde_pred()
+ctr001 %>% pmx_plot_npde_time()
+ctr001 %>% pmx_plot_npd_epred()
+# 可以修改图形选项
+# ctr001 %>% pmx_plot_npde_time(smooth = list(color="blue"), 
+# point = list(shape=4), 
+# is.draft=TRUE, 
+# labels = list(x = "Time (hours)", 
+#               y = "Normalized PDE"))
+```
+
+# step 4_2: 更新为二房室比例型残差模型
+
+```{r run002}
+two.cmt.prop <- \(){
+  ini({
+    # 在ini模块定义初始值，类似NONMEM的$THETA、$OMEGA和$SIGMA
+    # 使用赋值操作符（<-或=）定义theta值和残差，用~定义Etas
+    # theta和残差的标签会在最终输出中以parameter名出现
+    lcl = log(6.34)  #log Cl (L/h)
+    lQ = log(6.34)  #log Cl (L/h)    
+    lvc  = log(55)      #log v (L)
+    lvp  = log(55)      #log v (L)    
+    eta.cl ~ 0.287
+    eta.Q ~ 0.287
+    eta.vc ~ 0.312
+    eta.vp ~ 0.312
+    prop.err = 0.224   #proportional error (SD/mean)
+  })
+  model({
+    # 定义模型结构
+    cl = exp(lcl + eta.cl)
+    Q = exp(lQ + eta.Q)
+    vc  = exp(lvc  + eta.vc )
+    vp  = exp(lvp  + eta.vp )
+    ## 使用linCmt自动定义解析解模型
+    ## 残差为比例误差
+    linCmt() ~ prop(prop.err)
+  })
+}
+# 清理缓存，确保没有剩余的旧模型
+rxClean()
+# 检查模型和nlmixr2所做的一些假设
+nlmixr2(one.cmt.prop())
+
+## 使用nlmixr2估计参数
+run002 <- 
+  nlmixr2(
+    two.cmt.prop,    #建模初始值和模型结构
+    pkdata,            #建模数据集
+    est = "saem",      #估计算法，常用focei和seam
+    #the SAEM minimisation options:
+    saemControl(nBurn = 200, #200 SAEM burn-in iterations (the default)
+                nEm   = 300, #300 EM iterations (the default)
+                print = 50), #print every 50th iteration
+    #only print every 50th estimation step (default=1 which gives endless output)
+    tableControl(cwres = TRUE, npde = TRUE) #calculates NONMEM-style conditional weighted residuals and npde for diagnostics
+  ) # 可以用addCwres和addNpde后面添加cwres和npde
+
+
+## 建模结果存储在nlmixr2对象中，查看结果
+run002
+```
+
+保存建模结果以备将来使用
+
+```{r}
+save(run002, file = "run002.Rdata")
+#load(file = "run002.Rdata") #载入保存过的建模结果
+```
+
+对于SAEM算法，可以使用参数跟踪图来检查收敛性
+
+```{r}
+traceplot(run002)
+```
+
+# step 5_2: 模型评价_run002
+
+查看目标函数值（OFV）/赤池信息准则（AIC）/条件数/参数值等
+
+```{r}
+run002$objDf %>% knitr::kable()
+```
+
+查看参数估算值与相对标准误与个体间变异的收缩(ETA Shrinkage) 
+
+```{r}
+run002$parFixed %>% knitr::kable()
+```
+
+可以从run002直接导出以上汇总信息，此处未展示结果
+
+```{r, echo=TRUE, results='hide'}
+run002
+```
+
+查看个体间变异的收缩(ETA Shrinkage) 和残差变异的收缩(EPS Shrinkage)
+
+```{r}
+run002$shrink %>% knitr::kable()
+```
+
+比较run001和run002
+
+```{r}
+library(huxtable)
+
+huxreg(
+  "1cmt.prop"=run001,
+  "2cmt.prop"=run002,
+  statistics=c(N="nobs", "OBJF", "logLik", "AIC"),
+  stars = NULL
+)
+```
+```{r}
+run002$objDf-run001$objDf
+```
+
+使用nlmixr2内置的基本拟合图，此处未展示结果
+
+```{r, echo=TRUE, results='hide', fig.show='hide'}
+run002 %>% plot() #生成大量诊断图
+```
+
+## 使用ggPMX进行模型评价
+
+首先构造ggPMX控制器
+
+```{r}
+ctr002 <- pmx_nlmixr(run002,
+                     conts = c("WT", "CRCL", "AGE"), #连续变量名
+                     cats = c("SEX", "CENT"), #分类变量名
+                     vpc = FALSE,
+                     settings = pmx_settings(is.draft = TRUE))
+```
+
+生成DV vs PRED plot
+
+```{r}
+ctr002 %>% pmx_plot_dv_pred(scale_x_log10=TRUE, scale_y_log10=TRUE) + labs(title = "观测值 vs 群体预测值")
+```
+
+生成DV vs IPRED plot
+
+```{r}
+ctr002 %>% pmx_plot_dv_ipred(scale_x_log10=TRUE, scale_y_log10=TRUE)
+```
+
+生成个体预测诊断图 
+
+```{r}
+ctr002 %>% pmx_plot_individual(facets = list(nrow = 3, ncol = 3), which_pages = "all")
+```
+
+生成条件加权残差(CWRES)相关的诊断图 CWRES基于FOCE算法计算而来，性能优于加权残差(WRES,目前很少使用) 
+
+CWRES-时间散点图
+
+```{r}
+ctr002 %>% pmx_plot_cwres_time()
+```
+
+CWRES-群体预测值散点图:
+
+```{r}
+ctr002 %>% pmx_plot_cwres_pred()
+ctr002 %>% pmx_plot_cwres_cpred()
+```
+
+观察Cwres是否符合正态分布
+
+```{r}
+ctr002 %>% pmx_plot_cwres_qq()
+```
+
+个体加权残差(IWRES)相关的诊断图 评估模型的系统性偏差;检测残差模型是否合适;识别异常个体或异常数据
+
+```{r}
+ctr002 %>% pmx_plot_iwres_time()
+ctr002 %>% pmx_plot_iwres_ipred()
+```
+
+绝对个体加权残差来研究残差误差模型
+
+```{r}
+ctr002 %>% pmx_plot_abs_iwres_ipred()
+```
+
+绝对个体加权残差与时间的关系，以检测模型差异
+
+```{r}
+ctr002 %>% pmx_plot_abs_iwres_time()
+```
+
+观察iwres是否符合正态分布
+
+```{r}
+ctr002 %>% pmx_plot_iwres_qq()
+ctr002 %>% pmx_plot_iwres_dens()
+```
+
+基于经验贝叶斯估计(EBE)的诊断图
+
+ETA与协变量的散点图/箱线图 基于视觉评估参数与协变量之间的相关性.连续型协变量适宜采用散点图,分级型协变量则适合使用箱型图 ETA高收缩时,ETA与协变量的关系图可能会失真
+
+```{r}
+ctr002 %>% pmx_plot_eta_conts()
+ctr002 %>% pmx_plot_eta_cats()
+```
+
+PK参数之间的ETA散点图 考察参数间的相关性.如存在相关性,可通过协方差纳入 ETA高收缩时,ETA与ETA之间的关系图可能会失真
+
+```{r}
+ctr002 %>% pmx_plot_eta_matrix()
+```
+
+ETA直方分布图与Q-Q图
+
+ETA的直方图和QQ图可检验参数的ETA是否呈正态分布,以及ETA模型是否合理
+
+```{r}
+ctr002 %>% pmx_plot_eta_box() 
+ctr002 %>% pmx_plot_eta_hist() 
+ctr002 %>% pmx_plot_eta_qq()
+```
+
+基于模拟(Simulated-based)的诊断图
+
+npde vs pred plot
+
+```{r}
+ctr002 %>% pmx_plot_npde_qq()
+ctr002 %>% pmx_plot_npde_pred()
+ctr002 %>% pmx_plot_npde_time()
+ctr002 %>% pmx_plot_npd_epred()
+# 可以修改图形选项
+# ctr002 %>% pmx_plot_npde_time(smooth = list(color="blue"), 
+# point = list(shape=4), 
+# is.draft=TRUE, 
+# labels = list(x = "Time (hours)", 
+#               y = "Normalized PDE"))
+```
+
+# step 4_3: 删除二房室比例型残差模型里收缩过大的eta
+
+```{r run003}
+two.cmt.prop.2eta <- \(){
+  ini({
+    # 在ini模块定义初始值，类似NONMEM的$THETA、$OMEGA和$SIGMA
+    # 使用赋值操作符（<-或=）定义theta值和残差，用~定义Etas
+    # theta和残差的标签会在最终输出中以parameter名出现
+    lcl = log(4.52)  #log Cl (L/h)
+    lQ = log(7.82)  #log Cl (L/h)    
+    lvc  = log(90.3)      #log v (L)
+    lvp  = log(113)      #log v (L)    
+    eta.cl ~ 0.287
+    eta.vc ~ 0.312
+    prop.err = 0.123   #proportional error (SD/mean)
+  })
+  model({
+    # 定义模型结构
+    cl = exp(lcl + eta.cl)
+    Q = exp(lQ)
+    vc  = exp(lvc  + eta.vc )
+    vp  = exp(lvp)
+    ## 使用linCmt自动定义解析解模型
+    ## 残差为混合比例误差和加性误差
+    linCmt() ~ prop(prop.err)
+  })
+}
+
+## 清理缓存，确保没有剩余的旧模型
+rxClean()
+# 检查模型和nlmixr2所做的一些假设
+nlmixr2(two.cmt.prop.2eta)
+
+## 使用nlmixr2估计参数
+run003 <- 
+  nlmixr2(
+    two.cmt.prop.2eta,    #建模初始值和模型结构
+    pkdata,            #建模数据集
+    est = "saem",      #估计算法，常用focei和seam
+    #the SAEM minimisation options:
+    saemControl(nBurn = 200, #200 SAEM burn-in iterations (the default)
+                nEm   = 300, #300 EM iterations (the default)
+                print = 50), #print every 50th iteration
+    #only print every 50th estimation step (default=1 which gives endless output)
+    tableControl(cwres = TRUE, npde = TRUE) #calculates NONMEM-style conditional weighted residuals and npde for diagnostics
+  ) # 可以用addCwres和addNpde后面添加cwres和npde
+
+
+## 建模结果存储在nlmixr2对象中，查看结果
+run003
+```
+
+也使用nlmixr自带的模型更新功能
+
+```{r, eval=FALSE}
+run003_2 <- run002 %>% 
+  model(Q = exp(lQ),
+    vp  = exp(lvp)) %>% 
+  nlmixr(est = "saem",
+         control = list(print = 50))
+```
+
+保存建模结果以备将来使用
+
+```{r}
+save(run003, file = "run003.Rdata")
+#load(file = "run003.Rdata") #载入保存过的建模结果
+```
+
+对于SAEM算法，可以使用参数跟踪图来检查收敛性
+
+```{r}
+traceplot(run003)
+```
+
+# step 5_3: 模型评价_run003
+
+查看目标函数值（OFV）/赤池信息准则（AIC）/条件数/参数值等
+
+```{r}
+run003$objDf %>% knitr::kable()
+```
+
+查看参数估算值与相对标准误与个体间变异的收缩(ETA Shrinkage)
+
+```{r}
+run003$parFixed %>% knitr::kable()
+```
+
+可以从run003直接导出以上汇总信息，此处未展示结果
+
+```{r, echo=TRUE, results='hide'}
+run003
+```
+
+查看个体间变异的收缩(ETA Shrinkage) 和残差变异的收缩(EPS Shrinkage)
+
+```{r}
+run003$shrink %>% knitr::kable()
+```
+
+比较run001、run002和run003
+
+```{r}
+huxreg(
+  "1cmt.prop"=run001,
+  "2cmt.prop.4eta"=run002,
+  "2cmt.prop.2eta"=run003,
+  statistics=c(N="nobs", "OBJF", "logLik", "AIC"),
+  stars = NULL
+)
+```
+```{r}
+run003$objDf-run002$objDf
+```
+
+使用nlmixr2内置的基本拟合图，此处未展示结果
+
+```{r, echo=TRUE, results='hide', fig.show='hide'}
+run003 %>% plot() #生成大量诊断图
+```
+
+## 使用ggPMX进行模型评价
+
+```{r}
+ctr003 <- pmx_nlmixr(run003,
+                     conts = c("WT", "CRCL", "AGE"), #连续变量名
+                     cats = c("SEX", "CENT"), #分类变量名
+                     vpc = FALSE,
+                     settings = pmx_settings(is.draft = TRUE))
+```
+
+生成DV vs PRED plot
+
+```{r}
+ctr003 %>% pmx_plot_dv_pred(scale_x_log10=TRUE, scale_y_log10=TRUE) + labs(title = "观测值 vs 群体预测值")
+```
+
+生成DV vs IPRED plot 
+
+```{r}
+ctr003 %>% pmx_plot_dv_ipred(scale_x_log10=TRUE, scale_y_log10=TRUE)
+```
+
+生成个体预测诊断图 
+
+```{r}
+ctr003 %>% pmx_plot_individual(facets = list(nrow = 3, ncol = 3), which_pages = "all")
+```
+
+生成条件加权残差(CWRES)相关的诊断图 CWRES基于FOCE算法计算而来，性能优于加权残差(WRES,目前很少使用) 
+
+CWRES-时间散点图
+
+```{r}
+ctr003 %>% pmx_plot_cwres_time()
+```
+
+CWRES-群体预测值散点图:
+
+```{r}
+ctr003 %>% pmx_plot_cwres_pred()
+ctr003 %>% pmx_plot_cwres_cpred()
+```
+
+观察Cwres是否符合正态分布
+
+```{r}
+ctr003 %>% pmx_plot_cwres_qq()
+```
+
+个体加权残差(IWRES)相关的诊断图 评估模型的系统性偏差;检测残差模型是否合适;识别异常个体或异常数据
+
+```{r}
+ctr003 %>% pmx_plot_iwres_time()
+ctr003 %>% pmx_plot_iwres_ipred()
+```
+
+绝对个体加权残差来研究残差误差模型
+
+```{r}
+ctr003 %>% pmx_plot_abs_iwres_ipred()
+```
+
+绝对个体加权残差与时间的关系，以检测模型差异
+
+```{r}
+ctr003 %>% pmx_plot_abs_iwres_time()
+```
+
+观察iwres是否符合正态分布
+
+```{r}
+ctr003 %>% pmx_plot_iwres_qq()
+ctr003 %>% pmx_plot_iwres_dens()
+```
+
+基于经验贝叶斯估计(EBE)的诊断图
+
+ETA与协变量的散点图/箱线图 基于视觉评估参数与协变量之间的相关性.连续型协变量适宜采用散点图,分级型协变量则适合使用箱型图 ETA高收缩时,ETA与协变量的关系图可能会失真
+
+```{r}
+ctr003 %>% pmx_plot_eta_conts()
+ctr003 %>% pmx_plot_eta_cats()
+```
+
+PK参数之间的ETA散点图 考察参数间的相关性.如存在相关性,可通过协方差纳入 ETA高收缩时,ETA与ETA之间的关系图可能会失真
+
+```{r}
+ctr003 %>% pmx_plot_eta_matrix()
+```
+
+ETA直方分布图与Q-Q图
+
+ETA的直方图和QQ图可检验参数的ETA是否呈正态分布,以及ETA模型是否合理
+
+```{r}
+ctr003 %>% pmx_plot_eta_box() 
+ctr003 %>% pmx_plot_eta_hist() 
+ctr003 %>% pmx_plot_eta_qq()
+```
+
+基于模拟(Simulated-based)的诊断图
+
+npde vs pred plot
+
+```{r}
+ctr003 %>% pmx_plot_npde_qq()
+ctr003 %>% pmx_plot_npde_pred()
+ctr003 %>% pmx_plot_npde_time()
+ctr003 %>% pmx_plot_npd_epred()
+# 可以修改图形选项
+# ctr003 %>% pmx_plot_npde_time(smooth = list(color="blue"), 
+# point = list(shape=4), 
+# is.draft=TRUE, 
+# labels = list(x = "Time (hours)", 
+#               y = "Normalized PDE"))
+```
+# step 6: 筛选协变量
+
+使用horseshoes法筛选协变量
+
+```{r}
+hsDF <- horseshoeSummardf(run003, covarsVec = c("WT", "AGE", "SEX"))
+# 保存筛选结果
+save(hsDF, file = "hsDF001.Rdata")
+#load(file = "hsDF001.Rdata") #载入保存过的协变量筛选结果
+hsDF %>% knitr::kable()
+```
+
+添加协变量到模型内
+
+```{r}
+two.cmt.prop.2eta.cov <- \(){
+  ini({
+    # 在ini模块定义初始值，类似NONMEM的$THETA、$OMEGA和$SIGMA
+    # 使用赋值操作符（<-或=）定义theta值和残差，用~定义Etas
+    # theta和残差的标签会在最终输出中以parameter名出现
+    lcl = log(4.56)  #log Cl (L/h)
+    lQ = log(7.87)  #log Cl (L/h)    
+    lvc  = log(90.2)      #log v (L)
+    lvp  = log(110)      #log v (L) 
+    cov.cl_wt = 0.75
+    cov.vc_wt = 1
+    cov.vc_age = -0.1
+    eta.cl ~ 0.287
+    eta.vc ~ 0.312
+    prop.err = 0.125   #proportional error (SD/mean)
+  })
+  model({
+    # 定义模型结构
+    cl = exp(lcl + eta.cl + cov.cl_wt*log(WT/70))
+    Q = exp(lQ)
+    vc  = exp(lvc + eta.vc + cov.vc_wt*log(WT/70) + cov.vc_age*log(AGE/55))
+    vp  = exp(lvp)
+    ## 使用linCmt自动定义解析解模型
+    ## 残差为比例误差差
+    linCmt() ~ prop(prop.err)
+  })
+}
+
+## 清理缓存，确保没有剩余的旧模型
+rxClean()
+
+## 检查模型和nlmixr2所做的一些假设
+nlmixr2(two.cmt.prop.2eta.cov())
+
+## 使用nlmixr2估计参数
+run004 <- 
+  nlmixr2(
+    two.cmt.prop.2eta.cov,    #建模初始值和模型结构
+    pkdata,            #建模数据集
+    est = "saem",      #估计算法，常用focei和seam
+    #the SAEM minimisation options:
+    saemControl(nBurn = 200, #200 SAEM burn-in iterations (the default)
+                nEm   = 300, #300 EM iterations (the default)
+                print = 50), #print every 50th iteration
+    #only print every 50th estimation step (default=1 which gives endless output)
+    tableControl(cwres = TRUE, npde = TRUE) #calculates NONMEM-style conditional weighted residuals and npde for diagnostics
+  ) # 可以用addCwres和addNpde后面添加cwres和npde
+
+
+## 建模结果存储在nlmixr2对象中，查看结果
+run004
+
+## 保存建模结果以备将来使用
+save(run004, file = "run004.Rdata")
+#load(file = "run004.Rdata") #载入保存过的建模结果
+
+## 对于SAEM算法，可以使用参数跟踪图来检查收敛性
+traceplot(run004)
+```
+
+使用nlmixr内置功能更新模型
+
+```{r, eval=FALSE}
+run004_2 <- run003 %>% 
+  model(cl = exp(lcl + eta.cl + cov.cl_wt*log(WT/70)),
+    vc  = exp(lvc + eta.vc + cov.vc_wt*log(WT/70) + cov.vc_age*log(AGE/55))) %>% 
+  ini(cov.cl_wt = 0.75,
+      cov.vc_wt = 1,
+      cov.vc_age = -0.1) %>% 
+  nlmixr(est = "saem",      #估计算法，常用focei和seam
+    #the SAEM minimisation options:
+    control = list(print = 50))
+```
+
+cov.vc_age与0没有显著性差异，删除这个参数
+
+修改纳入的协变量
+
+```{r}
+two.cmt.prop.2eta.cov_2 <- \(){
+  ini({
+    # 在ini模块定义初始值，类似NONMEM的$THETA、$OMEGA和$SIGMA
+    # 使用赋值操作符（<-或=）定义theta值和残差，用~定义Etas
+    # theta和残差的标签会在最终输出中以parameter名出现
+    lcl = log(4.56)  #log Cl (L/h)
+    lQ = log(7.87)  #log Cl (L/h)    
+    lvc  = log(90.2)      #log v (L)
+    lvp  = log(110)      #log v (L) 
+    cov.cl_wt = 0.75
+    cov.vc_wt = 1
+    eta.cl ~ 0.287
+    eta.vc ~ 0.312
+    prop.err = 0.125   #proportional error (SD/mean)
+  })
+  model({
+    # 定义模型结构
+    cl = exp(lcl + eta.cl + cov.cl_wt*log(WT/70))
+    Q = exp(lQ)
+    vc  = exp(lvc + eta.vc + cov.vc_wt*log(WT/70))
+    vp  = exp(lvp)
+    ## 使用linCmt自动定义解析解模型
+    ## 残差为比例误差差
+    linCmt() ~ prop(prop.err)
+  })
+}
+
+## 清理缓存，确保没有剩余的旧模型
+rxClean()
+
+## 检查模型和nlmixr2所做的一些假设
+nlmixr2(two.cmt.prop.2eta.cov_2())
+
+## 使用nlmixr2估计参数
+run005 <- 
+  nlmixr2(
+    two.cmt.prop.2eta.cov_2,    #建模初始值和模型结构
+    pkdata,            #建模数据集
+    est = "saem",      #估计算法，常用focei和seam
+    #the SAEM minimisation options:
+    saemControl(nBurn = 200, #200 SAEM burn-in iterations (the default)
+                nEm   = 300, #300 EM iterations (the default)
+                print = 50), #print every 50th iteration
+    #only print every 50th estimation step (default=1 which gives endless output)
+    tableControl(cwres = TRUE, npde = TRUE) #calculates NONMEM-style conditional weighted residuals and npde for diagnostics
+  ) # 可以用addCwres和addNpde后面添加cwres和npde
+
+
+## 建模结果存储在nlmixr2对象中，查看结果
+run005
+
+## 保存建模结果以备将来使用
+save(run005, file = "run005.Rdata")
+#load(file = "run005.Rdata") #载入保存过的建模结果
+
+## 对于SAEM算法，可以使用参数跟踪图来检查收敛性
+traceplot(run005)
+```
+
+# step 5_4: 模型评价_run005
+
+查看目标函数值（OFV）/赤池信息准则（AIC）/条件数/参数值等
+
+```{r}
+run005$objDf %>% knitr::kable()
+```
+
+查看参数估算值与相对标准误与个体间变异的收缩(ETA Shrinkage) 
+
+```{r}
+run005$parFixed %>% knitr::kable()
+```
+
+可以从run005直接导出以上汇总信息，此处未展示结果
+
+```{r, echo=TRUE, results='hide'}
+run005
+```
+
+查看个体间变异的收缩(ETA Shrinkage) 和残差变异的收缩(EPS Shrinkage)
+
+```{r}
+run005$shrink %>% knitr::kable()
+```
+
+比较run001、run002、run001、run002和run005
+
+```{r}
+library(huxtable)
+
+huxreg(
+  "1cmt.prop"=run001,
+  "2cmt.prop.4eta"=run002,
+  "2cmt.prop.2eta"=run003,
+  "2cmt.prop.2eta.3cov"=run004,
+  "2cmt.prop.2eta.2cov"=run005,
+  statistics=c(N="nobs", "OBJF", "logLik", "AIC"),
+  stars = NULL
+)
+```
+```{r}
+run005$objDf-run003$objDf
+run005$objDf-run004$objDf
+```
+
+使用nlmixr2内置的基本拟合图，此处未展示结果
+
+```{r, echo=TRUE, results='hide', fig.show='hide'}
+run005 %>% plot() #生成大量诊断图
+```
+
+## 使用ggPMX进行模型评价
+
+```{r}
+ctr005 <- pmx_nlmixr(run005,
+                     conts = c("WT", "CRCL", "AGE"), #连续变量名
+                     cats = c("SEX", "CENT"), #分类变量名
+                     vpc = FALSE,
+                     settings = pmx_settings(is.draft = TRUE))
+```
+
+生成DV vs PRED plot
+
+```{r}
+ctr005 %>% pmx_plot_dv_pred(scale_x_log10=TRUE, scale_y_log10=TRUE) + labs(title = "观测值 vs 群体预测值")
+```
+
+生成DV vs IPRED plot 
+
+```{r}
+ctr005 %>% pmx_plot_dv_ipred(scale_x_log10=TRUE, scale_y_log10=TRUE)
+```
+
+生成个体预测诊断图 
+
+```{r}
+ctr005 %>% pmx_plot_individual(facets = list(nrow = 3, ncol = 3), which_pages = "all")
+```
+
+生成条件加权残差(CWRES)相关的诊断图 CWRES基于FOCE算法计算而来，性能优于加权残差(WRES,目前很少使用) 
+
+CWRES-时间散点图
+
+```{r}
+ctr005 %>% pmx_plot_cwres_time()
+```
+
+CWRES-群体预测值散点图:
+
+```{r}
+ctr005 %>% pmx_plot_cwres_pred()
+ctr005 %>% pmx_plot_cwres_cpred()
+```
+
+观察Cwres是否符合正态分布
+
+```{r}
+ctr005 %>% pmx_plot_cwres_qq()
+```
+
+个体加权残差(IWRES)相关的诊断图 评估模型的系统性偏差;检测残差模型是否合适;识别异常个体或异常数据
+
+```{r}
+ctr005 %>% pmx_plot_iwres_time()
+ctr005 %>% pmx_plot_iwres_ipred()
+```
+
+绝对个体加权残差来研究残差误差模型
+
+```{r}
+ctr005 %>% pmx_plot_abs_iwres_ipred()
+```
+
+绝对个体加权残差与时间的关系，以检测模型差异
+
+```{r}
+ctr005 %>% pmx_plot_abs_iwres_time()
+```
+
+观察iwres是否符合正态分布
+
+```{r}
+ctr005 %>% pmx_plot_iwres_qq()
+ctr005 %>% pmx_plot_iwres_dens()
+```
+
+基于经验贝叶斯估计(EBE)的诊断图
+
+ETA与协变量的散点图/箱线图 基于视觉评估参数与协变量之间的相关性.连续型协变量适宜采用散点图,分级型协变量则适合使用箱型图 ETA高收缩时,ETA与协变量的关系图可能会失真
+
+```{r}
+ctr005 %>% pmx_plot_eta_conts()
+ctr005 %>% pmx_plot_eta_cats()
+```
+
+PK参数之间的ETA散点图 考察参数间的相关性.如存在相关性,可通过协方差纳入 ETA高收缩时,ETA与ETA之间的关系图可能会失真
+
+```{r}
+ctr005 %>% pmx_plot_eta_matrix()
+```
+
+ETA直方分布图与Q-Q图
+
+ETA的直方图和QQ图可检验参数的ETA是否呈正态分布,以及ETA模型是否合理
+
+```{r}
+ctr005 %>% pmx_plot_eta_box() 
+ctr005 %>% pmx_plot_eta_hist() 
+ctr005 %>% pmx_plot_eta_qq()
+```
+
+基于模拟(Simulated-based)的诊断图
+
+npde vs pred plot
+
+```{r}
+ctr005 %>% pmx_plot_npde_qq()
+ctr005 %>% pmx_plot_npde_pred()
+ctr005 %>% pmx_plot_npde_time()
+ctr005 %>% pmx_plot_npd_epred()
+# 可以修改图形选项
+# ctr005 %>% pmx_plot_npde_time(smooth = list(color="blue"), 
+# point = list(shape=4), 
+# is.draft=TRUE, 
+# labels = list(x = "Time (hours)", 
+#               y = "Normalized PDE"))
+```
+# step 7: VPC
+
+```{r}
+p1 <- vpcPlot(run005, n = 1000, show=list(obs_dv=TRUE));
+p1 <- p1 + ylab("Concentrations")
+p1 
+# A prediction-corrected VPC
+# p2 <- vpcPlot(run005, n = 1000, pred_corr = TRUE, show=list(obs_dv=TRUE))
+# p2 <- p2 + ylab("Prediction-Corrected Concentrations")
+# library(patchwork)
+# p1 / p2
+```
+# step 8: bootstrap
+
+```{r, echo=TRUE, results='hide'}
+bootstrap001 <- bootstrapFit(run005, nboot = 10, restart = TRUE) # nboot = 10作演示
+```
+
+bootstrap后run005的置信区间结果被替换成bootstrap结果
+
+```{r}
+run005$parFixedDf %>% knitr::kable()
+```
+
+可以用如下代码切换回原来的结果
+
+```{r}
+setCov(run005, "linFim")
+run005$parFixedDf %>% knitr::kable()
+```
+
+用以下代码切换为bootstrap结果
+
+```{r}
+setCov(run005, "boot10") # boot后接的数字为bootstrap的次数
+```
+
+查看bootstrap成功次数
+
+```{r}
+bootstrap001$env$bootSummary
+```
+# step 9: Simulation
+
+从Nhanes database里抽取个体样本，读取Nhanes database
+
+```{r}
+Nhanes <- read_csv("NhanesDemo2006.csv")
+# 取成人集合
+NhanesA<- Nhanes %>% 
+  filter(AGE >= 18)
+```
+
+通过从18-98岁的10年的bin中抽样来减少数据集，每个箱子抽取200名受试者
+
+```{r}
+NhanesA <- NhanesA %>%
+  mutate(AgeCat = cut(AGE,
+                      breaks = seq(18, 98, 10),
+                      right = FALSE,
+                      include.lowest = TRUE))
+```
+
+```{r}
+set.seed(1122)
+NhanesA <- NhanesA %>%
+  group_by(AgeCat) %>%
+  slice_sample(n = 200, replace = TRUE) %>%
+  ungroup()
+NhanesA <- NhanesA %>% 
+  pull(WT)
+```
+
+创建给药采样事件
+
+```{r}
+ev1 <- et(amt=200, ii=12, until=168) %>%
+  et(seq(0, 192, by=0.5)) %>%
+  et(id=1:1400)
+```
+
+```{r}
+sim1 <- rxSolve(run005, ev1, iCov = data.frame(WT = NhanesA))
+```
+
+```{r}
+plot(sim1, ipredSim, log = "y") +
+  ylab("Conc. (mg/L)")
+
+confint(sim1, "ipredSim", level=0.95) |>
+    plot(ylab="Central Concentration", log="y")
+```
+
+```{r}
+sim2 <- rxSolve(run005, ev1, nStud = 10, iCov = data.frame(WT = NhanesA))
+```
+
+```{r}
+plot(sim2, ipredSim, log = "y") +
+  ylab("Conc. (mg/L)")
+
+confint(sim2, "ipredSim", level=0.95) |>
+    plot(ylab="Central Concentration", log="y")
+```
